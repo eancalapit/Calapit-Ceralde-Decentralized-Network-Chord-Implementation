@@ -1,0 +1,245 @@
+#include <SHA1.h>
+#include <Wire.h> 
+#include <esp_wifi.h>
+#include <esp_mesh.h>
+#include <esp_log.h>
+#include <nvs_flash.h>
+
+#define MESH_ID 0x00000001 // Mesh network ID, change as necessary
+#define MESH_CHANNEL 6 // WiFi channel for the mesh network
+#define MESH_MAX_LAYER 10 // Maximum number of layers
+#define MESH_ROUTER_SSID "MeshRouter" 
+#define MESH_ROUTER_PASS "cikretwahehe"
+
+const int loraFreq = 923E6; // Frequency AS923-3 for the Philippines
+const int numBits = 8; // Size of the identifier space (e.g., 8-bit = 256)
+const int numNodes = 4; // Total number of nodes 
+
+struct FingerTableEntry {
+  int start; // Start of the interval
+  int nodeID; // Node responsible for the interval
+};
+
+int nodeID; // Unique identifier for this node
+FingerTableEntry fingerTable[numBits]; // Finger table array
+mesh_addr_t meshParentAddr;
+bool isRoot = false;
+
+void setup() {
+  Serial.begin(115200);
+  while (!Serial);
+
+  // Detect if LoRa module is connected
+  if (detectLoRaModule()) {
+    // If LoRa is detected, initialize it
+    if (!LoRa.begin(loraFreq)) {
+      Serial.println("LoRa initialization failed!");
+      while (1);
+    }
+    Serial.println("LoRa Initialized");
+    #define USE_LORA
+  } else {
+    // Initialize ESP-WIFI-MESH as a fallback
+    initMeshNetwork();
+    Serial.println("ESP-WIFI-MESH Initialized");
+  }
+
+  // Generate a unique node identifier using SHA-1
+  nodeID = generateNodeID();
+
+  // Setup finger table
+  setupFingerTable();
+
+  // Notify the network about this node
+  broadcastNodeJoin();
+
+  // Perform initial stabilization
+  stabilize();
+}
+
+void loop() {
+#ifdef USE_LORA
+  // LoRa communication tasks
+  if (LoRa.parsePacket()) {
+    String receivedData = LoRa.readString();
+    processIncomingData(receivedData);
+  }
+#else
+  // ESP-WIFI-MESH communication tasks
+  meshDataReceive(); // Function to handle incoming mesh data
+#endif
+
+  // Periodically perform finger table updates and stabilization
+  static unsigned long lastStabilizeTime = 0;
+  if (millis() - lastStabilizeTime > 30000) { // Every 30 seconds
+    stabilize();
+    lastStabilizeTime = millis();
+  }
+}
+
+// Generate a unique node identifier using a hash function
+int generateNodeID() {
+  SHA1 sha1;
+  sha1.update("NodeAddress"); // Use a unique identifier like MAC address
+  byte* hash = sha1.result();
+  return hash[0] % numNodes; // Take a part of the hash as node ID
+}
+
+// Setup the finger table for this node
+void setupFingerTable() {
+  for (int i = 0; i < numBits; i++) {
+    fingerTable[i].start = (nodeID + (1 << i)) % numNodes;
+    fingerTable[i].nodeID = findSuccessor(fingerTable[i].start);
+  }
+}
+
+// Find the successor of a given key in the network
+int findSuccessor(int key) {
+  if (isResponsibleFor(key)) {
+    return nodeID;
+  }
+  return closestPrecedingNode(key);
+}
+
+// Determine if this node is responsible for a given key
+bool isResponsibleFor(int key) {
+  return key >= nodeID && key < (nodeID + 1) % numNodes;
+}
+
+// Find the closest preceding node for a given key using the finger table
+int closestPrecedingNode(int key) {
+  for (int i = numBits - 1; i >= 0; i--) {
+    if (fingerTable[i].nodeID > nodeID && fingerTable[i].nodeID < key) {
+      return fingerTable[i].nodeID;
+    }
+  }
+  return nodeID; // Default to this node if no closer node is found
+}
+
+// Broadcast node join message to the network
+void broadcastNodeJoin() {
+  String message = "JOIN:" + String(nodeID);
+#ifdef USE_LORA
+  LoRa.beginPacket();
+  LoRa.print(message);
+  LoRa.endPacket();
+#else
+  meshBroadcastData(message.c_str());
+#endif
+}
+
+// Handle incoming data and process it
+void processIncomingData(String data) {
+  if (data.startsWith("JOIN:")) {
+    int newNodeID = data.substring(5).toInt();
+    Serial.println("New node joined: " + String(newNodeID));
+    updateFingerTableForNewNode(newNodeID);
+  }
+  // Add more cases for other types of messages
+}
+
+// Update the finger table when a new node joins
+void updateFingerTableForNewNode(int newNodeID) {
+  for (int i = 0; i < numBits; i++) {
+    int start = (nodeID + (1 << i)) % numNodes;
+    if (newNodeID == start || (newNodeID > nodeID && newNodeID < fingerTable[i].nodeID)) {
+      fingerTable[i].nodeID = newNodeID;
+    }
+  }
+}
+
+// Stabilize the network to keep finger tables up to date
+void stabilize() {
+  for (int i = 0; i < numBits; i++) {
+    int successorID = fingerTable[i].nodeID;
+    // Send a request to the successor to check for changes
+#ifdef USE_LORA
+    String message = "CHECK:" + String(successorID);
+    LoRa.beginPacket();
+    LoRa.print(message);
+    LoRa.endPacket();
+#else
+    meshStabilize();
+#endif
+  }
+}
+
+// ESP-WIFI-MESH functions
+
+// Initialize the mesh network
+void initMeshNetwork() {
+  nvs_flash_init();
+  tcpip_adapter_init();
+  esp_wifi_init(NULL);
+  esp_wifi_start();
+
+  mesh_cfg_t cfg = MESH_INIT_CONFIG_DEFAULT();
+  cfg.channel = MESH_CHANNEL;
+  cfg.router.ssid_len = strlen(MESH_ROUTER_SSID);
+  memcpy((uint8_t*)cfg.router.ssid, MESH_ROUTER_SSID, cfg.router.ssid_len);
+  memcpy((uint8_t*)cfg.router.password, MESH_ROUTER_PASS, strlen(MESH_ROUTER_PASS));
+  cfg.mesh_id = MESH_ID;
+  cfg.mesh_max_layer = MESH_MAX_LAYER;
+  cfg.crypto_funcs = &g_wifi_default_mesh_crypto_funcs;
+  cfg.event_cb = &mesh_event_handler;
+
+  esp_mesh_set_config(&cfg);
+  esp_mesh_start();
+}
+
+// Broadcast data to all nodes in the mesh network
+void meshBroadcastData(const char *data) {
+  mesh_data_t meshData;
+  meshData.data = (uint8_t *)data;
+  meshData.size = strlen(data) + 1;
+  meshData.proto = MESH_PROTO_BIN;
+  meshData.tos = MESH_TOS_P2P;
+  esp_mesh_send(NULL, &meshData, 0, NULL, 0);
+}
+
+// Handle incoming data via ESP-WIFI-MESH
+void meshDataReceive() {
+  mesh_addr_t from;
+  mesh_data_t data;
+  data.data = (uint8_t *)malloc(1024);
+  data.size = 1024;
+  int flag = 0;
+  if (esp_mesh_recv(&from, &data, portMAX_DELAY, &flag, NULL, 0) == ESP_OK) {
+    Serial.println("Received data via ESP-WIFI-MESH: " + String((char*)data.data));
+  }
+  free(data.data);
+}
+
+// ESP-WIFI-MESH stabilization routine
+void meshStabilize() {
+  if (!esp_mesh_is_root()) {
+    if (esp_mesh_get_parent_bssid(&meshParentAddr) != ESP_OK) {
+      esp_mesh_connect();
+    }
+  }
+}
+
+// Mesh event handler
+void mesh_event_handler(mesh_event_t event) {
+  switch (event.id) {
+    case MESH_EVENT_STARTED:
+      Serial.println("Mesh network started");
+      break;
+    case MESH_EVENT_PARENT_CONNECTED:
+      esp_mesh_get_parent_bssid(&meshParentAddr);
+      break;
+    case MESH_EVENT_ROOT_ADDRESS:
+      isRoot = true;
+      break;
+    default:
+      break;
+  }
+}
+
+// Function to detect if LoRa module is attached
+bool detectLoRaModule() {
+  Wire.begin();
+  Wire.beginTransmission(0x60);
+  return (Wire.endTransmission() == 0);
+}
+
