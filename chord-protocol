@@ -10,6 +10,8 @@
 #define NODE_ID 0 // Define the unique node ID here
 #define NUM_NODES 4 // Total number of nodes
 #define BME280_ADDRESS 0x76
+#define HEARTBEAT_INTERVAL 10000 // Heartbeat interval in milliseconds
+#define TIMEOUT_INTERVAL 30000 // Timeout for detecting a dead node
 
 Adafruit_BME280 bme;
 RTC_DS3231 rtc;
@@ -23,6 +25,8 @@ FingerTableEntry fingerTable[8]; // Adjust as per identifier space
 unsigned long lastDataSendTime = 0;
 unsigned long lastFingerTableUpdateTime = 0;
 unsigned long lastSensorReadTime = 0;
+unsigned long lastHeartbeatTime = 0;
+bool nodeActive[NUM_NODES] = {true, true, true, true}; // Track active status of each node
 
 void setup() {
   Serial.begin(115200);
@@ -80,12 +84,19 @@ void loop() {
     sendData();
     lastDataSendTime = millis();
   }
+
+  // Send heartbeat to other nodes
+  if (millis() - lastHeartbeatTime >= HEARTBEAT_INTERVAL) {
+    sendHeartbeat();
+    lastHeartbeatTime = millis();
+  }
+
+  // Check for inactive nodes
+  checkNodeStatus();
 }
 
 // Function to determine transmit interval
 unsigned long getTransmitInterval() {
-  // Adjust transmit interval based on payload size
-  // Example: 1-2 hours based on payload size; adjust as needed
   return 3600000; // Default 1 hour (adjust based on logic)
 }
 
@@ -165,9 +176,42 @@ void logSignalQuality() {
   }
 }
 
+// Send a heartbeat signal to all other nodes
+void sendHeartbeat() {
+  String heartbeatMessage = "HEARTBEAT," + String(NODE_ID);
+  LoRa.beginPacket();
+  LoRa.print(heartbeatMessage);
+  LoRa.endPacket();
+}
+
+// Check for active nodes by listening for heartbeat responses
+void checkNodeStatus() {
+  if (LoRa.parsePacket()) {
+    String received = "";
+    while (LoRa.available()) {
+      received += (char)LoRa.read();
+    }
+    
+    // Parse heartbeat message
+    if (received.startsWith("HEARTBEAT")) {
+      int nodeId = received.substring(10).toInt();
+      if (nodeId >= 0 && nodeId < NUM_NODES) {
+        nodeActive[nodeId] = true; // Mark node as active
+      }
+    }
+  }
+
+  // Set inactive if no heartbeat received within timeout
+  for (int i = 0; i < NUM_NODES; i++) {
+    if (millis() - lastHeartbeatTime > TIMEOUT_INTERVAL) {
+      nodeActive[i] = false; // Mark node as inactive
+    }
+  }
+}
+
 // Setup finger table for this node
 void setupFingerTable() {
-  for (int i = 0; i < 8; i++) { // Adjust based on numBits
+  for (int i = 0; i < 8; i++) {
     fingerTable[i].start = (NODE_ID + (1 << i)) % NUM_NODES;
     fingerTable[i].nodeID = findSuccessor(fingerTable[i].start);
   }
@@ -182,10 +226,15 @@ void updateFingerTable() {
   logFingerTable();
 }
 
-// Find successor of a given key
+// Find successor of a given key, skipping inactive nodes
 int findSuccessor(int key) {
-  if (key == NODE_ID) return NODE_ID;
-  return (NODE_ID + 1) % NUM_NODES; // Simplified for demonstration
+  for (int i = 0; i < NUM_NODES; i++) {
+    int nodeId = (key + i) % NUM_NODES;
+    if (nodeActive[nodeId]) {
+      return nodeId;
+    }
+  }
+  return NODE_ID; // Fallback to self if no active successor found
 }
 
 // Log updated finger table with GPS data
@@ -197,7 +246,7 @@ void logFingerTable() {
     fingerTableFile.print(", Node ID: ");
     fingerTableFile.print(NODE_ID);
     fingerTableFile.print(", GPS: ");
-    fingerTableFile.println("LatLonCoordinates"); // Replace with actual GPS data
+    fingerTableFile.println("LatLonCoordinates");
     
     for (int i = 0; i < 8; i++) {
       fingerTableFile.print("Entry ");
